@@ -12,11 +12,28 @@
   (offset nil)
   (daylight-p nil))
 
+(defstruct (posix-tz-rule (:conc-name tz-rule-))
+  "A parsed POSIX TZ string, as found in the footer of a TZif v2+ file.  It
+says what the zone does after the last transition in its table: tzdata stops
+enumerating transitions in 2037 and states the rest as this rule.
+
+STD and DST are subzones (DST is NIL for a zone without daylight saving).
+START and END are the dates DST begins and ends, as (:JULIAN n),
+(:ZERO-BASED n) or (:MONTH month week weekday); START-TIME and END-TIME are
+seconds after local midnight, in the time in force just before each change."
+  (std nil)
+  (dst nil)
+  (start nil)
+  (start-time 7200)
+  (end nil)
+  (end-time 7200))
+
 (defstruct timezone
-  (transitions (coerce #(0) '(simple-array (signed-byte 32) (1))) :type (simple-array (signed-byte 32) (*)))
+  (transitions (coerce #(0) '(simple-array (signed-byte 64) (1))) :type (simple-array (signed-byte 64) (*)))
   (indexes (coerce #(0) '(simple-array (signed-byte 32) (1))) :type (simple-array (signed-byte 32) (*)))
   (subzones #() :type simple-vector)
   (leap-seconds nil :type list)
+  (rule nil :type (or null posix-tz-rule))
   (path nil)
   (name "anonymous" :type string)
   (loaded nil :type boolean))
@@ -201,7 +218,9 @@
 
 (defun transition-position (needle haystack)
   (declare (type integer needle)
-           (type (simple-array (signed-byte 32) (*)) haystack)
+           (type (or (simple-array (signed-byte 32) (*))
+                     (simple-array (signed-byte 64) (*)))
+                 haystack)
            (optimize (speed 3)))
   (loop
      with start of-type (signed-byte 32) = 0
@@ -220,59 +239,232 @@
   "When true, raise an error if trying to get an offset before the first
 known transition.")
 
+;;; Proleptic Gregorian day arithmetic for evaluating POSIX TZ rules, after
+;;; Howard Hinnant's days_from_civil and civil_from_days.  Days are counted
+;;; from 1970-01-01, which is what unix time divides into.
+
+(defun %days-from-civil (year month day)
+  "The number of days from 1970-01-01 to YEAR-MONTH-DAY."
+  (let* ((y (if (<= month 2) (1- year) year))
+         (era (floor y 400))
+         (year-of-era (- y (* era 400)))
+         (day-of-year (+ (floor (+ (* 153 (mod (+ month 9) 12)) 2) 5)
+                         (1- day)))
+         (day-of-era (+ (* 365 year-of-era)
+                        (floor year-of-era 4)
+                        (- (floor year-of-era 100))
+                        day-of-year)))
+    (+ (* era 146097) day-of-era -719468)))
+
+(defun %year-from-days (days)
+  "The year containing the day DAYS days after 1970-01-01."
+  (let* ((z (+ days 719468))
+         (era (floor z 146097))
+         (day-of-era (- z (* era 146097)))
+         (year-of-era (floor (+ day-of-era
+                                (- (floor day-of-era 1460))
+                                (floor day-of-era 36524)
+                                (- (floor day-of-era 146096)))
+                             365))
+         (day-of-year (- day-of-era
+                         (+ (* 365 year-of-era)
+                            (floor year-of-era 4)
+                            (- (floor year-of-era 100)))))
+         (shifted-month (floor (+ (* 5 day-of-year) 2) 153)))
+    ;; The era starts in March, so January and February (shifted months 10
+    ;; and 11) belong to the following civil year.
+    (+ year-of-era (* era 400) (if (>= shifted-month 10) 1 0))))
+
+(defun %tz-rule-date-days (date year)
+  "The day, counted from 1970-01-01, on which the POSIX TZ rule DATE falls in YEAR."
+  (ecase (first date)
+    (:julian
+     ;; Jn: 1 to 365, never counting 29 February.
+     (let ((n (second date)))
+       (+ (%days-from-civil year 1 1)
+          (1- n)
+          (if (and (>= n 60)
+                   (zerop (mod year 4))
+                   (or (plusp (mod year 100)) (zerop (mod year 400))))
+              1
+              0))))
+    (:zero-based
+     ;; n: 0 to 365, counting 29 February in leap years.
+     (+ (%days-from-civil year 1 1) (second date)))
+    (:month
+     ;; Mm.w.d: weekday d (0 = Sunday) of week w of month m; week 5 is the
+     ;; last such weekday of the month.
+     (destructuring-bind (month week weekday) (rest date)
+       (let* ((first-of-month (%days-from-civil year month 1))
+              (next-month (if (= month 12)
+                              (%days-from-civil (1+ year) 1 1)
+                              (%days-from-civil year (1+ month) 1)))
+              ;; 1970-01-01 was a Thursday.
+              (first-weekday (mod (+ first-of-month 4) 7))
+              (day (+ first-of-month
+                      (mod (- weekday first-weekday) 7)
+                      (* 7 (1- week)))))
+         (loop while (>= day next-month)
+               do (decf day 7))
+         day)))))
+
+(defun %tz-rule-transitions (rule year)
+  "The two transitions RULE makes in YEAR, as a list of (UNIX-TIME . SUBZONE)
+in the order they occur."
+  (let ((std (tz-rule-std rule))
+        (dst (tz-rule-dst rule)))
+    (stable-sort
+     (list (cons (+ (* 86400 (%tz-rule-date-days (tz-rule-start rule) year))
+                    (tz-rule-start-time rule)
+                    (- (subzone-offset std)))
+                 dst)
+           (cons (+ (* 86400 (%tz-rule-date-days (tz-rule-end rule) year))
+                    (tz-rule-end-time rule)
+                    (- (subzone-offset dst)))
+                 std))
+     #'< :key #'car)))
+
+(defun %search-transitions (unix-time guess-p transitions subzone-at)
+  "Find the subzone in force at UNIX-TIME, given the sorted vector
+TRANSITIONS and a function SUBZONE-AT that maps a transition index to the
+subzone that transition switches to (index -1 standing for the time before
+the first one).  Return the subzone and its transition index.
+
+When GUESS-P is true UNIX-TIME is a local time read as if it were UTC, so the
+search starts a day early and then takes the next transition if, with its
+offset applied, the time falls after it."
+  (let* ((count (length transitions))
+         (transition-idx (transition-position (if guess-p
+                                                  (- unix-time 86400)
+                                                  unix-time)
+                                              transitions))
+         (subzone (funcall subzone-at transition-idx)))
+    (when (and guess-p
+               (< transition-idx (1- count))) ;there is a next
+      (let* ((next-idx (1+ transition-idx))
+             (delta (- (aref transitions next-idx) unix-time)))
+        (when (<= delta 86400) ;check next offset
+          (let ((next-subzone (funcall subzone-at next-idx)))
+            (when (<= (+ delta (subzone-offset next-subzone)) 0)
+              ;; The next transition is valid
+              (setf transition-idx next-idx
+                    subzone next-subzone))))))
+    (values subzone transition-idx)))
+
+(defun %subzone-from-rule (timezone unix-time guess-p)
+  "The subzone in force at UNIX-TIME, which is at or after the last
+transition in TIMEZONE's table, according to TIMEZONE's POSIX TZ rule.
+Return as a second value the unix time of the transition, from the table or
+from the rule, that put that subzone in force."
+  (let* ((rule (timezone-rule timezone))
+         (transitions (timezone-transitions timezone))
+         (count (length transitions))
+         (last-time (when (plusp count) (aref transitions (1- count))))
+         (base (if (plusp count)
+                   (svref (timezone-subzones timezone)
+                          (aref (timezone-indexes timezone) (1- count)))
+                   (svref (timezone-subzones timezone) 0))))
+    (if (null (tz-rule-dst rule))
+        (values (tz-rule-std rule) last-time)
+        ;; Build a small table of the rule's transitions around UNIX-TIME,
+        ;; headed by the last real transition, and search it exactly as the
+        ;; file's own table is searched.
+        (let* ((year (%year-from-days (floor (if guess-p
+                                                 (- unix-time 86400)
+                                                 unix-time)
+                                             86400)))
+               (entries (append
+                         (when last-time (list (cons last-time base)))
+                         (loop for y from (1- year) to (1+ year)
+                               nconc (remove-if (lambda (entry)
+                                                  (and last-time
+                                                       (<= (car entry) last-time)))
+                                                (%tz-rule-transitions rule y)))))
+               (times (make-array (length entries)
+                                  :element-type '(signed-byte 64)
+                                  :initial-contents (mapcar #'car entries)))
+               (subzones (map 'simple-vector #'cdr entries)))
+          (multiple-value-bind (subzone idx)
+              (%search-transitions unix-time guess-p times
+                                   (lambda (idx)
+                                     (if (minusp idx)
+                                         base
+                                         (svref subzones idx))))
+            (values subzone
+                    (unless (minusp idx) (aref times idx))))))))
+
 (defun %subzone-as-of (timezone seconds days &optional guess-p)
   "TIMEZONE is a realized timezone; SECONDS and DAYS are 'timestamp-values'
 describing a local time, or null to ask for the subzone after the last
-transition. Return the applicable subzone and the transition-index for that
-subzone.
+transition in the table. Return three values: the applicable subzone, the
+index in the table of the transition that put it in force, and the unix time
+of that transition.
   When GUESS-P is true, the request is about SECONDS and DAYS in a timezone
 which may not be UTC, and therefore the unix-time derived from SECONDS and
 DAYS has an offset with respect to UTC: the offset of the subzone to be
-found."
+found.
+  Before the first transition the zone's first subzone applies -- in tzdata,
+its local mean time -- and the index and time are both NIL.  After the last
+transition the zone's POSIX TZ rule applies, when the file had one.  The
+transition that put the subzone in force may then be one the rule generated
+rather than one in the table: the time is that transition's, while the index
+stays at the last transition in the table, since the generated one has none."
   (let* ((indexes (timezone-indexes timezone))
          (index-length (length indexes))
-         (subzones (timezone-subzones timezone)))
-    (cond ((zerop index-length)
-           (values (elt subzones 0) nil))
-          ((not seconds)
-           (let ((transition-idx (1- index-length)))
-             (values (elt subzones (elt indexes transition-idx))
-                     transition-idx)))
+         (subzones (timezone-subzones timezone))
+         (rule (timezone-rule timezone)))
+    (cond ((not seconds)
+           (if (zerop index-length)
+               (values (elt subzones 0) nil nil)
+               (let ((transition-idx (1- index-length)))
+                 (values (elt subzones (elt indexes transition-idx))
+                         transition-idx
+                         (elt (timezone-transitions timezone) transition-idx)))))
           (t
            (let* ((transitions (timezone-transitions timezone))
-                  (unix-time (timestamp-values-to-unix seconds days))
-                  (transition-idx
-                   (transition-position (if guess-p
-                                            (- unix-time 86400)
-                                            unix-time)
-                                        transitions))
-                  (subzone (elt subzones (elt indexes (max 0 transition-idx)))))
-             ;; Decide what to do when unix-time is before the first transition
-             (cond ((<= 0 transition-idx))
-                   ((and *strict-first-subzone-validity*
-                         (< (if guess-p
-                                (- unix-time (subzone-offset subzone))
-                                unix-time)
-                            (elt transitions 0)))
-                    (error "Dates before ~A are not defined in ~A"
-                           (multiple-value-list (decode-universal-time
-                                                 (timestamp-to-universal
-                                                  (unix-to-timestamp unix-time))
-                                                 0))
-                           timezone))
-                   (t (setf transition-idx 0)))
-             (when (and guess-p
-                        (< transition-idx (1- index-length))) ;there is a next
-               (let* ((next-idx (1+ transition-idx))
-                      (delta (- (elt transitions next-idx) unix-time)))
-                 (when (<= delta 86400) ;check next offset
-                   (let ((next-subzone (elt subzones (elt indexes next-idx))))
-                     (when (<= (+ delta (subzone-offset next-subzone)) 0)
-                       ;; The next transition is valid
-                       (setf transition-idx next-idx
-                             subzone next-subzone))))))
-             (values subzone
-                     transition-idx))))))
+                  (unix-time (timestamp-values-to-unix seconds days)))
+             (if (and rule
+                      (= (transition-position (if guess-p
+                                                  (- unix-time 86400)
+                                                  unix-time)
+                                              transitions)
+                         (1- index-length)))
+                 ;; Past the end of the table, where the footer rule takes over.
+                 (multiple-value-bind (subzone transition-time)
+                     (%subzone-from-rule timezone unix-time guess-p)
+                   (values subzone
+                           (when (plusp index-length) (1- index-length))
+                           transition-time))
+                 (multiple-value-bind (subzone transition-idx)
+                     (%search-transitions unix-time guess-p transitions
+                                          (lambda (idx)
+                                            ;; RFC 8536 3.2: time type 0 is
+                                            ;; in force before the first
+                                            ;; transition.
+                                            (elt subzones (if (minusp idx)
+                                                              0
+                                                              (elt indexes idx)))))
+                   (when (and (minusp transition-idx)
+                              *strict-first-subzone-validity*
+                              (plusp index-length)
+                              (< (if guess-p
+                                     (- unix-time (subzone-offset subzone))
+                                     unix-time)
+                                 (elt transitions 0)))
+                     ;; DECODE-UNIVERSAL-TIME cannot take dates before
+                     ;; 1900, where real first transitions lie, and the
+                     ;; fixed-offset zones would trip this check again.
+                     (error "Dates before ~A are not defined in ~A"
+                            (let ((*strict-first-subzone-validity* nil))
+                              (multiple-value-list
+                               (decode-timestamp (unix-to-timestamp unix-time)
+                                                 :offset 0)))
+                            timezone))
+                   (if (minusp transition-idx)
+                       (values subzone nil nil)
+                       (values subzone
+                               transition-idx
+                               (elt transitions transition-idx))))))))))
 
 (declaim (ftype (function (t t &optional t) (or (signed-byte 32) (unsigned-byte 32))) %read-binary-integer))
 (defun %read-binary-integer (stream byte-count &optional (signed nil))
@@ -308,15 +500,192 @@ found."
                               :key (lambda (x) (aref timestamp-info x)))))
     (subzone-offset (aref timestamp-info (or subzone-idx 0)))))
 
+(defun %read-binary-integer-64 (stream)
+  "Read a signed 64-bit integer in network byte order from the binary STREAM."
+  (let ((result 0))
+    (loop repeat 8
+          do (setf result (logior (ash result 8) (read-byte stream))))
+    (if (logbitp 63 result)
+        (- result (ash 1 64))
+        result)))
+
 (defun %tz-verify-magic-number (inf zone)
-  ;; read and verify magic number
+  "Read and verify the TZif magic number and return the format version: 1
+for a version 1 file, otherwise 2, 3, 4..."
   (let ((magic-buf (make-array 4 :element-type 'unsigned-byte)))
     (read-sequence magic-buf inf :start 0 :end 4)
     (when (string/= (map 'string #'code-char magic-buf) "TZif" :end1 4)
       (error 'invalid-timezone-file :path (timezone-path zone))))
-  ;; skip 16 bytes for "future use"
-  (let ((ignore-buf (make-array 16 :element-type 'unsigned-byte)))
-    (read-sequence ignore-buf inf :start 0 :end 16)))
+  ;; The version byte is NUL for version 1, otherwise an ASCII digit.
+  (let ((version (read-byte inf)))
+    ;; skip 15 bytes for "future use"
+    (let ((ignore-buf (make-array 15 :element-type 'unsigned-byte)))
+      (read-sequence ignore-buf inf :start 0 :end 15))
+    (if (zerop version)
+        1
+        (- version (char-code #\0)))))
+
+(defun %tz-skip-v1-data (inf header zone)
+  "Skip the version 1 data block described by HEADER."
+  (let* ((length (+ (* 5 (getf header :transition-count)) ; 4-byte time + index
+                    (* 6 (getf header :type-count))
+                    (getf header :abbrev-length)
+                    (* 8 (getf header :leap-count))
+                    (getf header :wall-count)
+                    (getf header :utc-count)))
+         (buf (make-array length :element-type '(unsigned-byte 8))))
+    (unless (= length (read-sequence buf inf))
+      (error 'invalid-timezone-file :path (timezone-path zone)))))
+
+(defun %tz-read-time (inf time-size)
+  (if (= time-size 8)
+      (%read-binary-integer-64 inf)
+      (%read-binary-integer inf 4 t)))
+
+(defun %tz-read-footer (inf)
+  "Read the newline-enclosed POSIX TZ string that ends a TZif v2+ file, or
+return NIL if there is none."
+  (when (eql (read-byte inf nil nil) 10)
+    (loop with chars = '()
+          for byte = (read-byte inf nil nil)
+          do (cond ((null byte) (return nil))
+                   ((= byte 10) (return (coerce (nreverse chars) 'string)))
+                   (t (push (code-char byte) chars))))))
+
+(defun %parse-posix-tz (string)
+  "Parse the POSIX TZ STRING -- std offset [dst [offset] [,start[/time],end[/time]]]
+-- into a POSIX-TZ-RULE with freshly made subzones.  Return NIL if STRING is
+empty or not a valid TZ string.  Rule times may run from -167 to 167 hours, as
+RFC 8536 allows for version 3 files."
+  (let ((pos 0)
+        (length (length string)))
+    (labels ((fail ()
+               (return-from %parse-posix-tz nil))
+             (peek ()
+               (when (< pos length) (char string pos)))
+             (expect (char)
+               (if (eql (peek) char) (incf pos) (fail)))
+             (parse-name ()
+               (let ((start pos) end)
+                 (cond ((eql (peek) #\<)
+                        ;; <...> quotes names containing digits and signs.
+                        (setf start (incf pos))
+                        (loop while (and (peek) (char/= (peek) #\>))
+                              do (incf pos))
+                        (setf end pos)
+                        (expect #\>))
+                       (t
+                        (loop while (and (peek) (alpha-char-p (peek)))
+                              do (incf pos))
+                        (setf end pos)))
+                 (if (< (- end start) 3)
+                     (fail)
+                     (subseq string start end))))
+             (parse-number (max-digits)
+               (let ((start pos))
+                 (loop while (and (peek)
+                                  (digit-char-p (peek))
+                                  (< (- pos start) max-digits))
+                       do (incf pos))
+                 (if (= start pos)
+                     (fail)
+                     (parse-integer string :start start :end pos))))
+             (parse-hms (max-hours)
+               ;; [+-]hh[:mm[:ss]], as seconds.
+               (let ((sign (case (peek)
+                             (#\- (incf pos) -1)
+                             (#\+ (incf pos) 1)
+                             (t 1)))
+                     (hours (parse-number 3))
+                     (minutes 0)
+                     (seconds 0))
+                 (when (eql (peek) #\:)
+                   (incf pos)
+                   (setf minutes (parse-number 2))
+                   (when (eql (peek) #\:)
+                     (incf pos)
+                     (setf seconds (parse-number 2))))
+                 (when (or (> hours max-hours) (> minutes 59) (> seconds 59))
+                   (fail))
+                 (* sign (+ (* 3600 hours) (* 60 minutes) seconds))))
+             (parse-offset ()
+               ;; POSIX offsets count hours west of Greenwich; subzones
+               ;; count seconds east.
+               (let ((offset (- (parse-hms 24))))
+                 (if (typep offset 'timezone-offset) offset (fail))))
+             (parse-date ()
+               (case (peek)
+                 (#\J
+                  (incf pos)
+                  (let ((n (parse-number 3)))
+                    (if (<= 1 n 365) (list :julian n) (fail))))
+                 (#\M
+                  (incf pos)
+                  (let ((month (parse-number 2))
+                        (week (progn (expect #\.) (parse-number 1)))
+                        (weekday (progn (expect #\.) (parse-number 1))))
+                    (if (and (<= 1 month 12) (<= 1 week 5) (<= 0 weekday 6))
+                        (list :month month week weekday)
+                        (fail))))
+                 (t
+                  (let ((n (parse-number 3)))
+                    (if (<= 0 n 365) (list :zero-based n) (fail))))))
+             (parse-time ()
+               (if (eql (peek) #\/)
+                   (progn (incf pos) (parse-hms 167))
+                   7200)))
+      (when (zerop length)
+        (fail))
+      (let* ((std-name (parse-name))
+             (std-offset (parse-offset))
+             (rule (make-posix-tz-rule
+                    :std (make-subzone :abbrev std-name
+                                       :offset std-offset
+                                       :daylight-p nil))))
+        (when (peek)
+          (let* ((dst-name (parse-name))
+                 (dst-offset (if (and (peek) (char/= (peek) #\,))
+                                 (parse-offset)
+                                 (+ std-offset 3600))))
+            (setf (tz-rule-dst rule) (make-subzone :abbrev dst-name
+                                                   :offset dst-offset
+                                                   :daylight-p t))
+            (cond ((peek)
+                   (expect #\,)
+                   (setf (tz-rule-start rule) (parse-date)
+                         (tz-rule-start-time rule) (parse-time))
+                   (expect #\,)
+                   (setf (tz-rule-end rule) (parse-date)
+                         (tz-rule-end-time rule) (parse-time)))
+                  (t
+                   ;; POSIX leaves a missing rule implementation-defined;
+                   ;; tzcode and glibc use the US rules.
+                   (setf (tz-rule-start rule) '(:month 3 2 0)
+                         (tz-rule-end rule) '(:month 11 1 0))))))
+        (when (peek)
+          (fail))
+        rule))))
+
+(defun %tz-adopt-rule-subzones (rule subzones)
+  "Make RULE share subzones with the zone's table SUBZONES where they match,
+appending any that are new.  Return the resulting subzone vector."
+  (flet ((adopt (subzone)
+           (or (find-if (lambda (candidate)
+                          (and (equal (subzone-abbrev candidate)
+                                      (subzone-abbrev subzone))
+                               (eql (subzone-offset candidate)
+                                    (subzone-offset subzone))
+                               (eq (subzone-daylight-p candidate)
+                                   (subzone-daylight-p subzone))))
+                        subzones)
+               (progn
+                 (setf subzones (concatenate 'simple-vector
+                                             subzones (list subzone)))
+                 subzone))))
+    (setf (tz-rule-std rule) (adopt (tz-rule-std rule)))
+    (when (tz-rule-dst rule)
+      (setf (tz-rule-dst rule) (adopt (tz-rule-dst rule))))
+    subzones))
 
 (defun %tz-read-header (inf)
   `(:utc-count ,(%read-binary-integer inf 4)
@@ -326,12 +695,12 @@ found."
     :type-count ,(%read-binary-integer inf 4)
     :abbrev-length ,(%read-binary-integer inf 4)))
 
-(defun %tz-read-transitions (inf count)
+(defun %tz-read-transitions (inf count &optional (time-size 4))
   (make-array count
-              :element-type '(signed-byte 32)
+              :element-type '(signed-byte 64)
               :initial-contents
               (loop for idx from 1 upto count
-                 collect (%read-binary-integer inf 4 t))))
+                 collect (%tz-read-time inf time-size))))
 
 (defun %tz-read-indexes (inf count)
   (make-array count
@@ -351,12 +720,15 @@ found."
 (defun leap-seconds-adjustment (leap-seconds)
   (cdr leap-seconds))
 
-(defun %tz-read-leap-seconds (inf count)
+(defun %tz-read-leap-seconds (inf count &optional (time-size 4))
   (when (plusp count)
     (loop for idx from 1 upto count
-          collect (%read-binary-integer inf 4) into sec
+          collect (if (= time-size 8)
+                      (%read-binary-integer-64 inf)
+                      (%read-binary-integer inf 4))
+            into sec
           collect (%read-binary-integer inf 4) into adjustment
-          finally (return (cons (make-array count :element-type '(signed-byte 32) :initial-contents sec)
+          finally (return (cons (make-array count :element-type '(signed-byte 64) :initial-contents sec)
                                 (make-array count :element-type '(signed-byte 32) :initial-contents adjustment))))))
 
 (defun %tz-read-abbrevs (inf length)
@@ -390,26 +762,40 @@ found."
                     :abbrev (%string-from-unsigned-byte-vector abbrevs (third info))))))
 
 (defun %read-timezone (inf zone)
-  (%tz-verify-magic-number inf zone)
+  (let* ((version (%tz-verify-magic-number inf zone))
+         (header (%tz-read-header inf)))
+    (when (>= version 2)
+      ;; A v2+ file repeats its data with 64-bit times after the v1 block,
+      ;; whose 32-bit times cannot reach before 1901-12-13, and then ends
+      ;; with a POSIX TZ rule for times after its last transition.  Read
+      ;; that instead.
+      (%tz-skip-v1-data inf header zone)
+      (%tz-verify-magic-number inf zone)
+      (setf header (%tz-read-header inf)))
 
-  ;; read header values
-  (let* ((header (%tz-read-header inf))
-         (timezone-transitions (%tz-read-transitions inf (getf header :transition-count)))
-         (subzone-indexes (%tz-read-indexes inf (getf header :transition-count)))
-         (subzone-raw-info (%tz-read-subzone inf (getf header :type-count)))
-         (abbreviation-buf (%tz-read-abbrevs inf (getf header :abbrev-length)))
-         (leap-second-info (%tz-read-leap-seconds inf (getf header :leap-count)))
-         (std-indicators (%tz-read-indicators inf (getf header :wall-count)))
-         (gmt-indicators (%tz-read-indicators inf (getf header :utc-count)))
-         (subzone-info (%tz-make-subzones subzone-raw-info
-                                          abbreviation-buf
-                                          gmt-indicators
-                                          std-indicators)))
+    (let* ((time-size (if (>= version 2) 8 4))
+           (timezone-transitions (%tz-read-transitions inf (getf header :transition-count) time-size))
+           (subzone-indexes (%tz-read-indexes inf (getf header :transition-count)))
+           (subzone-raw-info (%tz-read-subzone inf (getf header :type-count)))
+           (abbreviation-buf (%tz-read-abbrevs inf (getf header :abbrev-length)))
+           (leap-second-info (%tz-read-leap-seconds inf (getf header :leap-count) time-size))
+           (std-indicators (%tz-read-indicators inf (getf header :wall-count)))
+           (gmt-indicators (%tz-read-indicators inf (getf header :utc-count)))
+           (subzone-info (%tz-make-subzones subzone-raw-info
+                                            abbreviation-buf
+                                            gmt-indicators
+                                            std-indicators))
+           (rule (when (>= version 2)
+                   (let ((footer (%tz-read-footer inf)))
+                     (when footer (%parse-posix-tz footer))))))
+      (when rule
+        (setf subzone-info (%tz-adopt-rule-subzones rule subzone-info)))
 
-    (setf (timezone-transitions zone) timezone-transitions)
-    (setf (timezone-indexes zone) subzone-indexes)
-    (setf (timezone-subzones zone) subzone-info)
-    (setf (timezone-leap-seconds zone) leap-second-info))
+      (setf (timezone-transitions zone) timezone-transitions)
+      (setf (timezone-indexes zone) subzone-indexes)
+      (setf (timezone-subzones zone) subzone-info)
+      (setf (timezone-leap-seconds zone) leap-second-info)
+      (setf (timezone-rule zone) rule)))
   (setf (timezone-loaded zone) t))
 
 (defun %realize-timezone (zone &optional reload)
@@ -495,13 +881,16 @@ found."
 
 
 (defun timezones-matching-subzone (abbreviated-name timestamp)
-  "Returns list of lists of active timezone, matched subzone and last transition time
-   for timezones that have subzone matching specified ABBREVIATED-NAME as of TIMESTAMP moment if provided. "
+  "Return a list of (TIMEZONE SUBZONE TRANSITION-TIME) for each timezone whose
+subzone in force at TIMESTAMP is abbreviated ABBREVIATED-NAME.
+TRANSITION-TIME is the unix time of the transition that put SUBZONE in
+force, or NIL if TIMESTAMP is before the zone's first transition."
   (loop for zone in (gethash abbreviated-name *abbreviated-subzone-name->timezone-list*)
-        ;; get the subzone and the latest transition index
-        for (subzone transition-idx) = (multiple-value-list (%subzone-as-of zone (sec-of timestamp) (day-of timestamp)))
+        ;; get the subzone and the time of the transition into it
+        for (subzone nil transition-time)
+          = (multiple-value-list (%subzone-as-of zone (sec-of timestamp) (day-of timestamp)))
         if (equal abbreviated-name (subzone-abbrev subzone))
-          collect (list zone subzone (when transition-idx (elt (timezone-transitions zone) transition-idx)))))
+          collect (list zone subzone transition-time)))
 
 (defun all-timezones-matching-subzone (abbreviated-name)
   "Returns list of lists of timezone, matched subzone and last transition time

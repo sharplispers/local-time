@@ -10,8 +10,12 @@
         (setf (day-of time) day)
         (when (zerop (mod index 10000))
           (print time))
-        (let ((parsed (parse-timestring (format-timestring nil time))))
-          (is (timestamp= parsed time))))))
+        ;; An ISO 8601 offset has no seconds field, so a timestamp whose
+        ;; offset is not a whole number of minutes -- local mean time, before
+        ;; standard time, in most zones -- cannot round-trip exactly.
+        (when (zerop (mod (timestamp-subtimezone time *default-timezone*) 60))
+          (let ((parsed (parse-timestring (format-timestring nil time))))
+            (is (timestamp= parsed time)))))))
 
 (deftest test/parsing/parse-format-consistency ()
   (flet ((compare (nsec sec min hour day mon year str
